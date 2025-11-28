@@ -254,23 +254,32 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					}
 				}
 				resp = proxy.filterResponse(resp, ctx)
-				defer resp.Body.Close()
 
 				isWebsocket := isWebSocketHandshake(resp.Header)
 
-				err = resp.Write(proxyClient)
-				if err != nil {
-					httpError(proxyClient, ctx, err)
+				if isWebsocket {
+					// For WebSocket, write response and use resp.Body as the connection
+					err = resp.Write(proxyClient)
+					if err != nil {
+						httpError(proxyClient, ctx, err)
+						return false
+					}
+
+					ctx.Logf("Response looks like websocket upgrade.")
+					// resp.Body implements io.ReadWriter for 101 Switching Protocols responses
+					wsConn, ok := resp.Body.(io.ReadWriter)
+					if !ok {
+						ctx.Warnf("Unable to use Websocket connection")
+						return false
+					}
+					proxy.proxyWebsocket(ctx, wsConn, proxyClient)
 					return false
 				}
 
-				if isWebsocket {
-					ctx.Logf("Response looks like websocket upgrade.")
-					// For plain HTTP WebSocket, we use the raw connections directly
-					// targetSiteCon is already connected to the remote server
-					// proxyClient is the connection to the browser
-					proxy.proxyWebsocket(ctx, targetSiteCon, proxyClient)
-					// We can't reuse connection after WebSocket handshake
+				defer resp.Body.Close()
+				err = resp.Write(proxyClient)
+				if err != nil {
+					httpError(proxyClient, ctx, err)
 					return false
 				}
 
@@ -977,19 +986,33 @@ func (proxy *ProxyHttpServer) handleAutoMitmHTTP(ctx *ProxyCtx, r *http.Request,
 				}
 			}
 			resp = proxy.filterResponse(resp, ctx)
-			defer resp.Body.Close()
 
 			isWebsocket := isWebSocketHandshake(resp.Header)
 
-			err = resp.Write(proxyClient)
-			if err != nil {
-				httpError(proxyClient, ctx, err)
+			if isWebsocket {
+				// For WebSocket, we need to write the response headers manually
+				// and then use resp.Body as the connection (which implements io.ReadWriter for 101 responses)
+				err = resp.Write(proxyClient)
+				if err != nil {
+					httpError(proxyClient, ctx, err)
+					return false
+				}
+
+				ctx.Logf("Response looks like websocket upgrade.")
+				// resp.Body implements io.ReadWriter for 101 Switching Protocols responses
+				wsConn, ok := resp.Body.(io.ReadWriter)
+				if !ok {
+					ctx.Warnf("Unable to use Websocket connection")
+					return false
+				}
+				proxy.proxyWebsocket(ctx, wsConn, proxyClient)
 				return false
 			}
 
-			if isWebsocket {
-				ctx.Logf("Response looks like websocket upgrade.")
-				proxy.proxyWebsocket(ctx, targetSiteCon, proxyClient)
+			defer resp.Body.Close()
+			err = resp.Write(proxyClient)
+			if err != nil {
+				httpError(proxyClient, ctx, err)
 				return false
 			}
 
