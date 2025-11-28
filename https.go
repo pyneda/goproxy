@@ -293,11 +293,13 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			for !clientTlsReader.IsEOF() {
 				req, err := clientTlsReader.ReadRequest()
 				ctx := &ProxyCtx{
-					Req:          req,
-					Session:      atomic.AddInt64(&proxy.sess, 1),
-					Proxy:        proxy,
-					UserData:     ctx.UserData,
-					RoundTripper: ctx.RoundTripper,
+					Req:                  req,
+					Session:              atomic.AddInt64(&proxy.sess, 1),
+					Proxy:                proxy,
+					UserData:             ctx.UserData,
+					RoundTripper:         ctx.RoundTripper,
+					WebSocketHandler:     ctx.WebSocketHandler,
+					WebSocketCopyHandler: ctx.WebSocketCopyHandler,
 				}
 				if err != nil && !errors.Is(err, io.EOF) {
 					ctx.Warnf("Cannot read TLS request from mitm'd client %v %v", r.Host, err)

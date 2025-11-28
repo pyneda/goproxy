@@ -28,6 +28,14 @@ type ProxyCtx struct {
 	Session   int64
 	certStore CertStorage
 	Proxy     *ProxyHttpServer
+	// WebSocketHandler, if set, will be used to handle WebSocket connections.
+	// This allows full control over the bidirectional WebSocket data flow.
+	// If nil, the default pass-through behavior is used.
+	WebSocketHandler WebSocketHandler
+	// WebSocketCopyHandler, if set, provides a simpler interception mechanism
+	// by replacing the io.Copy function used for WebSocket data transfer.
+	// This is ignored if WebSocketHandler is set.
+	WebSocketCopyHandler WebSocketCopyHandler
 }
 
 type RoundTripper interface {
