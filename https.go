@@ -2,6 +2,7 @@ package goproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -29,6 +30,7 @@ const (
 	ConnectHijack
 	ConnectHTTPMitm
 	ConnectProxyAuthHijack
+	ConnectAutoMitm // Auto-detect TLS vs plain HTTP by peeking at first byte
 )
 
 var (
@@ -36,6 +38,7 @@ var (
 	MitmConnect     = &ConnectAction{Action: ConnectMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
 	HTTPMitmConnect = &ConnectAction{Action: ConnectHTTPMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
 	RejectConnect   = &ConnectAction{Action: ConnectReject, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	AutoMitmConnect = &ConnectAction{Action: ConnectAutoMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
 )
 
 var _errorRespMaxLength int64 = 500
@@ -253,9 +256,21 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				resp = proxy.filterResponse(resp, ctx)
 				defer resp.Body.Close()
 
+				isWebsocket := isWebSocketHandshake(resp.Header)
+
 				err = resp.Write(proxyClient)
 				if err != nil {
 					httpError(proxyClient, ctx, err)
+					return false
+				}
+
+				if isWebsocket {
+					ctx.Logf("Response looks like websocket upgrade.")
+					// For plain HTTP WebSocket, we use the raw connections directly
+					// targetSiteCon is already connected to the remote server
+					// proxyClient is the connection to the browser
+					proxy.proxyWebsocket(ctx, targetSiteCon, proxyClient)
+					// We can't reuse connection after WebSocket handshake
 					return false
 				}
 
@@ -477,6 +492,43 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			}
 			ctx.Logf("Exiting on EOF")
 		}()
+	case ConnectAutoMitm:
+		// Auto-detect TLS vs plain HTTP by peeking at first byte from client
+		_, _ = proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+
+		// We need to peek at the first byte to determine if this is TLS or plain HTTP
+		// TLS handshake records start with 0x16 (22 = handshake record type)
+		peekBuf := make([]byte, 1)
+		n, err := proxyClient.Read(peekBuf)
+		if err != nil || n == 0 {
+			ctx.Warnf("Cannot peek first byte from client: %v", err)
+			return
+		}
+
+		isTLS := peekBuf[0] == 0x16
+
+		// Create a reader that replays the peeked byte followed by rest of connection
+		peekReader := io.MultiReader(bytes.NewReader(peekBuf), proxyClient)
+		// Create a ReadWriter that uses the peekReader for reads and proxyClient for writes
+		peekedConn := &peekedConn{Reader: peekReader, Conn: proxyClient}
+
+		if isTLS {
+			ctx.Logf("Auto-detected TLS connection, mitm proxying it")
+			// Handle as TLS MITM
+			tlsConfig := defaultTLSConfig
+			if todo.TLSConfig != nil {
+				tlsConfig, err = todo.TLSConfig(host, ctx)
+				if err != nil {
+					httpError(proxyClient, ctx, err)
+					return
+				}
+			}
+			go proxy.handleAutoMitmTLS(ctx, r, peekedConn, host, tlsConfig)
+		} else {
+			ctx.Logf("Auto-detected plain HTTP connection, http mitm proxying it")
+			// Handle as HTTP MITM
+			proxy.handleAutoMitmHTTP(ctx, r, peekedConn, host)
+		}
 	case ConnectProxyAuthHijack:
 		_, _ = proxyClient.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n"))
 		todo.Hijack(r, proxyClient, ctx)
@@ -696,4 +748,254 @@ func (proxy *ProxyHttpServer) initializeTLSconnection(
 		return nil, err
 	}
 	return tlsConn, nil
+}
+
+// peekedConn wraps a net.Conn but allows prepending already-read bytes
+type peekedConn struct {
+	io.Reader
+	net.Conn
+}
+
+func (c *peekedConn) Read(b []byte) (int, error) {
+	return c.Reader.Read(b)
+}
+
+// handleAutoMitmTLS handles the CONNECT tunnel when TLS is detected
+func (proxy *ProxyHttpServer) handleAutoMitmTLS(ctx *ProxyCtx, r *http.Request, proxyClient net.Conn, host string, tlsConfig *tls.Config) {
+	rawClientTls := tls.Server(proxyClient, tlsConfig)
+	defer rawClientTls.Close()
+	if err := rawClientTls.Handshake(); err != nil {
+		ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
+		return
+	}
+
+	clientTlsReader := http1parser.NewRequestReader(proxy.PreventCanonicalization, rawClientTls)
+	for !clientTlsReader.IsEOF() {
+		req, err := clientTlsReader.ReadRequest()
+		ctx := &ProxyCtx{
+			Req:                  req,
+			Session:              atomic.AddInt64(&proxy.sess, 1),
+			Proxy:                proxy,
+			UserData:             ctx.UserData,
+			RoundTripper:         ctx.RoundTripper,
+			WebSocketHandler:     ctx.WebSocketHandler,
+			WebSocketCopyHandler: ctx.WebSocketCopyHandler,
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			ctx.Warnf("Cannot read TLS request from mitm'd client %v %v", r.Host, err)
+		}
+		if err != nil {
+			return
+		}
+
+		req.RemoteAddr = r.RemoteAddr
+		ctx.Logf("req %v", r.Host)
+
+		if !strings.HasPrefix(req.URL.String(), "https://") {
+			req.URL, err = url.Parse("https://" + r.Host + req.URL.String())
+		}
+
+		if continueLoop := func(req *http.Request) bool {
+			requestContext, finishRequest := context.WithCancel(req.Context())
+			req = req.WithContext(requestContext)
+			defer finishRequest()
+
+			ctx.Req = req
+
+			req, resp := proxy.filterRequest(req, ctx)
+			if resp == nil {
+				if req.Method == "PRI" {
+					reader := clientTlsReader.Reader()
+					_, err := reader.Discard(6)
+					if err != nil {
+						ctx.Warnf("Failed to process HTTP2 client preface: %v", err)
+						return false
+					}
+					if !proxy.AllowHTTP2 {
+						ctx.Warnf("HTTP2 connection failed: disallowed")
+						return false
+					}
+					tr := H2Transport{reader, rawClientTls, tlsConfig.Clone(), host}
+					if _, err := tr.RoundTrip(req); err != nil {
+						ctx.Warnf("HTTP2 connection failed: %v", err)
+					} else {
+						ctx.Logf("Exiting on EOF")
+					}
+					return false
+				}
+				if err != nil {
+					if req.URL != nil {
+						ctx.Warnf("Illegal URL %s", "https://"+r.Host+req.URL.Path)
+					} else {
+						ctx.Warnf("Illegal URL %s", "https://"+r.Host)
+					}
+					return false
+				}
+				if !proxy.KeepHeader {
+					RemoveProxyHeaders(ctx, req)
+				}
+				resp, err = func() (*http.Response, error) {
+					defer req.Body.Close()
+					return ctx.RoundTrip(req)
+				}()
+				if err != nil {
+					ctx.Warnf("Cannot read TLS response from mitm'd server %v", err)
+					return false
+				}
+				ctx.Logf("resp %v", resp.Status)
+			}
+			origBody := resp.Body
+			resp = proxy.filterResponse(resp, ctx)
+			bodyModified := resp.Body != origBody
+			defer resp.Body.Close()
+
+			text := resp.Status
+			statusCode := strconv.Itoa(resp.StatusCode) + " "
+			text = strings.TrimPrefix(text, statusCode)
+			if _, err := io.WriteString(rawClientTls, "HTTP/1.1"+" "+statusCode+text+"\r\n"); err != nil {
+				ctx.Warnf("Cannot write TLS response HTTP status from mitm'd client: %v", err)
+				return false
+			}
+
+			isWebsocket := isWebSocketHandshake(resp.Header)
+			if isWebsocket || resp.Request.Method == http.MethodHead {
+			} else if (resp.StatusCode >= 100 && resp.StatusCode < 200) ||
+				resp.StatusCode == http.StatusNoContent {
+				resp.Header.Del("Content-Length")
+			} else if bodyModified {
+				resp.Header.Del("Content-Length")
+				resp.Header.Set("Transfer-Encoding", "chunked")
+			}
+			if !isWebsocket {
+				resp.Header.Set("Connection", "close")
+			}
+			if err := resp.Header.Write(rawClientTls); err != nil {
+				ctx.Warnf("Cannot write TLS response header from mitm'd client: %v", err)
+				return false
+			}
+			if _, err = io.WriteString(rawClientTls, "\r\n"); err != nil {
+				ctx.Warnf("Cannot write TLS response header end from mitm'd client: %v", err)
+				return false
+			}
+
+			if isWebsocket {
+				ctx.Logf("Response looks like websocket upgrade.")
+				wsConn, ok := resp.Body.(io.ReadWriter)
+				if !ok {
+					ctx.Warnf("Unable to use Websocket connection")
+					return false
+				}
+				proxy.proxyWebsocket(ctx, wsConn, rawClientTls)
+				return false
+			}
+
+			if resp.Request.Method == http.MethodHead ||
+				(resp.StatusCode >= 100 && resp.StatusCode < 200) ||
+				resp.StatusCode == http.StatusNoContent ||
+				resp.StatusCode == http.StatusNotModified {
+			} else {
+				if bodyModified {
+					chunked := newChunkedWriter(rawClientTls)
+					if _, err := io.Copy(chunked, resp.Body); err != nil {
+						ctx.Warnf("Cannot write TLS response body from mitm'd client: %v", err)
+						return false
+					}
+					if err := chunked.Close(); err != nil {
+						ctx.Warnf("Cannot write TLS chunked EOF from mitm'd client: %v", err)
+						return false
+					}
+					if _, err = io.WriteString(rawClientTls, "\r\n"); err != nil {
+						ctx.Warnf("Cannot write TLS response chunked trailer from mitm'd client: %v", err)
+						return false
+					}
+				} else {
+					if _, err := io.Copy(rawClientTls, resp.Body); err != nil {
+						ctx.Warnf("Cannot write TLS response body from mitm'd client: %v", err)
+						return false
+					}
+					if err := rawClientTls.Close(); err != nil {
+						ctx.Warnf("Cannot write TLS EOF from mitm'd client: %v", err)
+						return false
+					}
+				}
+			}
+
+			return true
+		}(req); !continueLoop {
+			return
+		}
+	}
+	ctx.Logf("Exiting on EOF")
+}
+
+// handleAutoMitmHTTP handles the CONNECT tunnel when plain HTTP is detected
+func (proxy *ProxyHttpServer) handleAutoMitmHTTP(ctx *ProxyCtx, r *http.Request, proxyClient net.Conn, host string) {
+	var targetSiteCon net.Conn
+	var remote *bufio.Reader
+
+	client := http1parser.NewRequestReader(proxy.PreventCanonicalization, proxyClient)
+	for !client.IsEOF() {
+		req, err := client.ReadRequest()
+		if err != nil && !errors.Is(err, io.EOF) {
+			ctx.Warnf("cannot read request of MITM HTTP client: %+#v", err)
+		}
+		if err != nil {
+			return
+		}
+
+		if requestOk := func(req *http.Request) bool {
+			requestContext, finishRequest := context.WithCancel(req.Context())
+			req = req.WithContext(requestContext)
+			defer finishRequest()
+
+			req.RemoteAddr = r.RemoteAddr
+			ctx.Logf("req %v", r.Host)
+			ctx.Req = req
+
+			req, resp := proxy.filterRequest(req, ctx)
+			if resp == nil {
+				if targetSiteCon == nil {
+					targetSiteCon, err = proxy.connectDial(ctx, "tcp", host)
+					if err != nil {
+						ctx.Warnf("Error dialing to %s: %s", host, err.Error())
+						return false
+					}
+					remote = bufio.NewReader(targetSiteCon)
+				}
+
+				if err := req.Write(targetSiteCon); err != nil {
+					httpError(proxyClient, ctx, err)
+					return false
+				}
+				resp, err = func() (*http.Response, error) {
+					defer req.Body.Close()
+					return http.ReadResponse(remote, req)
+				}()
+				if err != nil {
+					httpError(proxyClient, ctx, err)
+					return false
+				}
+			}
+			resp = proxy.filterResponse(resp, ctx)
+			defer resp.Body.Close()
+
+			isWebsocket := isWebSocketHandshake(resp.Header)
+
+			err = resp.Write(proxyClient)
+			if err != nil {
+				httpError(proxyClient, ctx, err)
+				return false
+			}
+
+			if isWebsocket {
+				ctx.Logf("Response looks like websocket upgrade.")
+				proxy.proxyWebsocket(ctx, targetSiteCon, proxyClient)
+				return false
+			}
+
+			return true
+		}(req); !requestOk {
+			break
+		}
+	}
 }

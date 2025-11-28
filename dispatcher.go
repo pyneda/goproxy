@@ -355,6 +355,15 @@ var AlwaysMitm FuncHttpsHandler = func(host string, ctx *ProxyCtx) (*ConnectActi
 	return MitmConnect, host
 }
 
+// AlwaysAutoMitm is a HttpsHandler that auto-detects whether the client is using TLS or plain HTTP
+// after the CONNECT tunnel is established. This is useful when proxying WebSocket connections
+// to plain HTTP servers (ws://) which use CONNECT but don't use TLS.
+//
+//	proxy.OnRequest().HandleConnect(goproxy.AlwaysAutoMitm)
+var AlwaysAutoMitm FuncHttpsHandler = func(host string, ctx *ProxyCtx) (*ConnectAction, string) {
+	return AutoMitmConnect, host
+}
+
 // AlwaysReject is a HttpsHandler that drops any CONNECT request, for example, this code will disallow
 // connections to hosts on any other port than 443
 //
