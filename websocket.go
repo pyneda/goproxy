@@ -42,6 +42,10 @@ func (f FuncWebSocketHandler) HandleWebSocket(remoteConn io.ReadWriter, proxyCli
 // or modification of data without implementing the full bidirectional flow.
 type WebSocketCopyHandler func(dst io.Writer, src io.Reader, direction WebSocketDirection, ctx *ProxyCtx) (int64, error)
 
+// WebSocketCloseHandler is called when the WebSocket proxy connection is fully closed.
+// This allows cleanup of resources associated with the WebSocket connection.
+type WebSocketCloseHandler func(ctx *ProxyCtx)
+
 func headerContains(header http.Header, name string, value string) bool {
 	for _, v := range header[name] {
 		for _, s := range strings.Split(v, ",") {
@@ -79,6 +83,13 @@ func (proxy *ProxyHttpServer) proxyWebsocket(ctx *ProxyCtx, remoteConn io.ReadWr
 		return
 	}
 
+	// Ensure cleanup handler is called when done
+	defer func() {
+		if ctx.WebSocketCloseHandler != nil {
+			ctx.WebSocketCloseHandler(ctx)
+		}
+	}()
+
 	// 2 is the number of goroutines, this code is implemented according to
 	// https://stackoverflow.com/questions/52031332/wait-for-one-goroutine-to-finish
 	waitChan := make(chan struct{}, 2)
@@ -102,6 +113,7 @@ func (proxy *ProxyHttpServer) proxyWebsocket(ctx *ProxyCtx, remoteConn io.ReadWr
 		waitChan <- struct{}{}
 	}()
 
-	// Wait until one end closes the connection
+	// Wait for BOTH directions to complete to avoid goroutine leaks
+	<-waitChan
 	<-waitChan
 }

@@ -36,6 +36,9 @@ type ProxyCtx struct {
 	// by replacing the io.Copy function used for WebSocket data transfer.
 	// This is ignored if WebSocketHandler is set.
 	WebSocketCopyHandler WebSocketCopyHandler
+	// WebSocketCloseHandler, if set, is called when the WebSocket proxy connection
+	// is fully closed. This allows cleanup of resources.
+	WebSocketCloseHandler WebSocketCloseHandler
 }
 
 type RoundTripper interface {

@@ -258,7 +258,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				isWebsocket := isWebSocketHandshake(resp.Header)
 
 				if isWebsocket {
-					// For WebSocket, write response and use resp.Body as the connection
+					// For WebSocket, write the 101 response to client
 					err = resp.Write(proxyClient)
 					if err != nil {
 						httpError(proxyClient, ctx, err)
@@ -266,13 +266,8 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					}
 
 					ctx.Logf("Response looks like websocket upgrade.")
-					// resp.Body implements io.ReadWriter for 101 Switching Protocols responses
-					wsConn, ok := resp.Body.(io.ReadWriter)
-					if !ok {
-						ctx.Warnf("Unable to use Websocket connection")
-						return false
-					}
-					proxy.proxyWebsocket(ctx, wsConn, proxyClient)
+					wsServerConn := &bufferedConn{r: remote, Conn: targetSiteCon}
+					proxy.proxyWebsocket(ctx, wsServerConn, proxyClient)
 					return false
 				}
 
@@ -317,13 +312,14 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			for !clientTlsReader.IsEOF() {
 				req, err := clientTlsReader.ReadRequest()
 				ctx := &ProxyCtx{
-					Req:                  req,
-					Session:              atomic.AddInt64(&proxy.sess, 1),
-					Proxy:                proxy,
-					UserData:             ctx.UserData,
-					RoundTripper:         ctx.RoundTripper,
-					WebSocketHandler:     ctx.WebSocketHandler,
-					WebSocketCopyHandler: ctx.WebSocketCopyHandler,
+					Req:                   req,
+					Session:               atomic.AddInt64(&proxy.sess, 1),
+					Proxy:                 proxy,
+					UserData:              ctx.UserData,
+					RoundTripper:          ctx.RoundTripper,
+					WebSocketHandler:      ctx.WebSocketHandler,
+					WebSocketCopyHandler:  ctx.WebSocketCopyHandler,
+					WebSocketCloseHandler: ctx.WebSocketCloseHandler,
 				}
 				if err != nil && !errors.Is(err, io.EOF) {
 					ctx.Warnf("Cannot read TLS request from mitm'd client %v %v", r.Host, err)
@@ -769,6 +765,17 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 	return c.Reader.Read(b)
 }
 
+// bufferedConn wraps a bufio.Reader and net.Conn for WebSocket proxying
+// when http.ReadResponse has buffered data we need to read
+type bufferedConn struct {
+	r *bufio.Reader
+	net.Conn
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) {
+	return c.r.Read(b)
+}
+
 // handleAutoMitmTLS handles the CONNECT tunnel when TLS is detected
 func (proxy *ProxyHttpServer) handleAutoMitmTLS(ctx *ProxyCtx, r *http.Request, proxyClient net.Conn, host string, tlsConfig *tls.Config) {
 	rawClientTls := tls.Server(proxyClient, tlsConfig)
@@ -782,13 +789,14 @@ func (proxy *ProxyHttpServer) handleAutoMitmTLS(ctx *ProxyCtx, r *http.Request, 
 	for !clientTlsReader.IsEOF() {
 		req, err := clientTlsReader.ReadRequest()
 		ctx := &ProxyCtx{
-			Req:                  req,
-			Session:              atomic.AddInt64(&proxy.sess, 1),
-			Proxy:                proxy,
-			UserData:             ctx.UserData,
-			RoundTripper:         ctx.RoundTripper,
-			WebSocketHandler:     ctx.WebSocketHandler,
-			WebSocketCopyHandler: ctx.WebSocketCopyHandler,
+			Req:                   req,
+			Session:               atomic.AddInt64(&proxy.sess, 1),
+			Proxy:                 proxy,
+			UserData:              ctx.UserData,
+			RoundTripper:          ctx.RoundTripper,
+			WebSocketHandler:      ctx.WebSocketHandler,
+			WebSocketCopyHandler:  ctx.WebSocketCopyHandler,
+			WebSocketCloseHandler: ctx.WebSocketCloseHandler,
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			ctx.Warnf("Cannot read TLS request from mitm'd client %v %v", r.Host, err)
@@ -990,8 +998,7 @@ func (proxy *ProxyHttpServer) handleAutoMitmHTTP(ctx *ProxyCtx, r *http.Request,
 			isWebsocket := isWebSocketHandshake(resp.Header)
 
 			if isWebsocket {
-				// For WebSocket, we need to write the response headers manually
-				// and then use resp.Body as the connection (which implements io.ReadWriter for 101 responses)
+				// For WebSocket, write the 101 response to client
 				err = resp.Write(proxyClient)
 				if err != nil {
 					httpError(proxyClient, ctx, err)
@@ -999,13 +1006,8 @@ func (proxy *ProxyHttpServer) handleAutoMitmHTTP(ctx *ProxyCtx, r *http.Request,
 				}
 
 				ctx.Logf("Response looks like websocket upgrade.")
-				// resp.Body implements io.ReadWriter for 101 Switching Protocols responses
-				wsConn, ok := resp.Body.(io.ReadWriter)
-				if !ok {
-					ctx.Warnf("Unable to use Websocket connection")
-					return false
-				}
-				proxy.proxyWebsocket(ctx, wsConn, proxyClient)
+				wsServerConn := &bufferedConn{r: remote, Conn: targetSiteCon}
+				proxy.proxyWebsocket(ctx, wsServerConn, proxyClient)
 				return false
 			}
 
